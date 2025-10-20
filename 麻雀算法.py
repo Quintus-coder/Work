@@ -1,13 +1,8 @@
-import heapq
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import folium
-from folium import plugins
-import matplotlib as mpl  # 导入 matplotlib 库
 
 # ========== 中文乱码修复配置 ==========
-# 设置中文字体（例如 SimHei 黑体）。如果SimHei不存在，请尝试 'WenQuanYi Micro Hei' 或安装中文字体。
+# 设置中文字体（例如 SimHei 黑体）
 plt.rcParams['font.sans-serif'] = ['SimHei']
 # 解决保存图像时负号 '-' 显示为方块的问题
 plt.rcParams['axes.unicode_minus'] = False
@@ -19,9 +14,17 @@ DRONE_SPEED = 40.0  # 无人机速度
 TRUCK_SPEED = 30.0  # 卡车速度
 COST_PER_UNIT_DISTANCE = 0.4
 TRUCK_COST_PER_UNIT_DISTANCE = 0.2
-BEAM_WIDTH = 20
 TARGET_DRONE_RATIO = 0.3  # 无人机期望执行比例
 ALPHA = 0.00001  # 动态平衡因子
+
+# 麻雀算法参数
+POPULATION_SIZE = 50
+MAX_ITERATIONS = 200
+PRODUCER_RATIO = 0.2
+AWARE_RATIO = 0.1
+SAFETY_THRESHOLD = 0.6
+LOWER_BOUND = 0.0
+UPPER_BOUND = 1.0
 
 # 仓库位置
 truck_position = np.array([22.584514, 113.131083])  # (纬度, 经度)
@@ -59,8 +62,7 @@ DRONE_ALPHA = 1.0  # 无人机路径不透明
 
 
 # ---------------- 基础函数 ----------------
-def distance(p1, p2):
-    return float(np.linalg.norm(p1 - p2))
+def distance(p1, p2):   return float(np.linalg.norm(p1 - p2))
 
 
 def cost_drone(truck_pos, task):
@@ -84,14 +86,6 @@ def cost_truck(truck_pos, task):
     return dist * TRUCK_COST_PER_UNIT_DISTANCE, task.copy(), dist / TRUCK_SPEED
 
 
-def heuristic(visited_mask, truck_pos):
-    remaining = [i for i in range(NUM_TASKS) if not (visited_mask >> i) & 1]
-    if not remaining:
-        return 0.0
-    min_dist = min(distance(truck_pos, tasks[i]) for i in remaining)
-    return min_dist * min(COST_PER_UNIT_DISTANCE, TRUCK_COST_PER_UNIT_DISTANCE)
-
-
 # ---------------- 节点类 ----------------
 class Node:
     def __init__(self, visited_mask, truck_pos, cost, path, drone_count):
@@ -105,63 +99,113 @@ class Node:
         return self.cost < other.cost
 
 
-# ---------------- Beam Search 主体 ----------------
-def beam_search():
-    start = Node(0, truck_position.copy(), 0.0, [], 0)
-    beam = [(0.0, start)]
-    best_cost = float("inf")
+# ---------------- 麻雀算法相关函数 ----------------
+def decode_solution(position):
+    """将连续位置解码为任务顺序和执行模式"""
+    order_scores = position[:NUM_TASKS]
+    mode_scores = position[NUM_TASKS: 2 * NUM_TASKS]
+    order = list(np.argsort(order_scores))
+    modes = ['drone' if mode_scores[i] > 0.5 else 'truck' for i in range(NUM_TASKS)]
+    return order, modes
+
+
+def simulate_sequence(order, modes):
+    """根据顺序与模式模拟一次配送过程，返回最终节点与适应度信息"""
+    visited_mask = 0
+    truck_pos = truck_position.copy()
+    total_cost = 0.0
+    path = []
+    drone_count = 0
+
+    for task_idx in order:
+        task = tasks[task_idx]
+        if modes[task_idx] == 'drone':
+            step_cost, new_pos, _ = cost_drone(truck_pos, task)
+            drone_count += 1
+        else:
+            step_cost, new_pos, _ = cost_truck(truck_pos, task)
+
+        total_cost += step_cost
+        path.append((modes[task_idx], task_idx, total_cost))
+        truck_pos = new_pos
+        visited_mask |= (1 << task_idx)
+
+    back_cost, truck_pos, _ = cost_truck(truck_pos, truck_position)
+    total_cost += back_cost
+    path.append(("truck_back", -1, total_cost))
+
+    drone_ratio = drone_count / max(1, NUM_TASKS)
+    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * total_cost
+    fitness = total_cost + balance_penalty
+
+    node = Node(visited_mask, truck_pos, total_cost, path, drone_count)
+    return fitness, node, total_cost
+
+
+def evaluate_position(position):
+    """评估给定位置的适应度"""
+    order, modes = decode_solution(position)
+    fitness, node, total_cost = simulate_sequence(order, modes)
+    return fitness, node, total_cost
+
+
+def sparrow_search():
+    dim = NUM_TASKS * 2
+    population = np.random.uniform(LOWER_BOUND, UPPER_BOUND, size=(POPULATION_SIZE, dim))
+    fitness_list = np.zeros(POPULATION_SIZE)
+
     best_solution = None
+    best_cost = float("inf")
+    best_fitness = float("inf")
 
-    while beam:
-        new_beam = []
-        for _, node in beam:
-            visited_mask = node.visited_mask
+    for i in range(POPULATION_SIZE):
+        fitness, node, total_cost = evaluate_position(population[i])
+        fitness_list[i] = fitness
+        if fitness < best_fitness:
+            best_fitness = fitness
+            best_cost = total_cost
+            best_solution = node
 
-            # 所有任务完成 → 返回仓库
-            if visited_mask == (1 << NUM_TASKS) - 1:
-                back_cost, _, _ = cost_truck(node.truck_pos, truck_position)
-                final_cost = node.cost + back_cost
+    for iter_idx in range(MAX_ITERATIONS):
+        sort_idx = np.argsort(fitness_list)
+        population = population[sort_idx]
+        fitness_list = fitness_list[sort_idx]
 
-                final_node = Node(visited_mask, truck_position.copy(), final_cost,
-                                  node.path + [("truck_back", -1, final_cost)], node.drone_count)
+        producer_count = max(1, int(POPULATION_SIZE * PRODUCER_RATIO))
+        aware_count = max(1, int(POPULATION_SIZE * AWARE_RATIO))
 
-                if final_cost < best_cost:
-                    best_cost, best_solution = final_cost, final_node
-                continue
+        global_best = population[0].copy()
+        global_worst = population[-1].copy()
 
-            # 扩展子节点
-            for i in range(NUM_TASKS):
-                if (visited_mask >> i) & 1:
-                    continue
+        for i in range(producer_count):
+            r2 = np.random.rand()
+            if r2 < SAFETY_THRESHOLD:
+                population[i] = population[i] * np.exp(-i / (np.random.rand() * MAX_ITERATIONS + 1e-8))
+            else:
+                population[i] = population[i] + np.random.normal(size=dim)
 
-                for mode in ["drone", "truck"]:
-                    if mode == "drone":
-                        step_cost, new_pos, _ = cost_drone(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count + 1
-                    else:
-                        step_cost, new_pos, _ = cost_truck(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count
+        for i in range(producer_count, POPULATION_SIZE):
+            if i > POPULATION_SIZE / 2:
+                population[i] = np.random.normal(size=dim) * np.exp((global_worst - population[i]) / (i ** 2 + 1e-8))
+            else:
+                population[i] = global_best + np.abs(population[i] - global_best) * np.random.uniform(-1, 1, size=dim)
 
-                    new_node = Node(
-                        visited_mask | (1 << i),
-                        new_pos,
-                        node.cost + step_cost,
-                        node.path + [(mode, i, node.cost + step_cost)],
-                        new_drone_count
-                    )
+        aware_indices = np.random.choice(POPULATION_SIZE, aware_count, replace=False)
+        for idx in aware_indices:
+            if fitness_list[idx] > best_fitness:
+                population[idx] = global_best + np.random.normal(size=dim) * np.abs(population[idx] - global_best)
+            else:
+                population[idx] = population[idx] + np.random.uniform(-1, 1, size=dim) * np.abs(population[idx] - global_worst)
 
-                    drone_ratio = new_node.drone_count / max(1, bin(new_node.visited_mask).count("1"))
-                    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * node.cost
-                    f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty
+        population = np.clip(population, LOWER_BOUND, UPPER_BOUND)
 
-                    if mode == "drone":
-                        f -= 0.02
-
-                    new_beam.append((f, new_node))
-
-        beam = sorted(new_beam, key=lambda x: x[0])[:BEAM_WIDTH]
-        if not beam:
-            break
+        for i in range(POPULATION_SIZE):
+            fitness, node, total_cost = evaluate_position(population[i])
+            fitness_list[i] = fitness
+            if fitness < best_fitness:
+                best_fitness = fitness
+                best_cost = total_cost
+                best_solution = node
 
     return best_solution, best_cost
 
@@ -181,12 +225,12 @@ def get_offset_vector(p1, p2, magnitude):
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
-    best_solution, best_cost = beam_search()
+    best_solution, best_cost = sparrow_search()
 
     if not best_solution:
         print("❌ 未找到可行方案")
     else:
-        print("\n✅ Beam Search 改进版结果：")
+        print("\n✅ 麻雀算法 结果：")
         print(f"总成本: {best_cost:.4f} 元")
 
         # ---------- Matplotlib 可视化 (横纵坐标对调) ----------
@@ -304,7 +348,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, tasks[task_id])
 
                 # X轴(纬度), Y轴(经度)
-                plt.text(tasks[task_id][0], tasks[task_id][1],
+                plt.text(float(tasks[task_id][0]), float(tasks[task_id][1]),
                          f"{step}", fontsize=8, color='black',
                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle="circle,pad=0.2"),
                          ha='center', va='center', zorder=6)
@@ -316,7 +360,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, truck_position)
                 current_pos = new_pos
 
-        plt.title(f"Beam Search 路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
+        plt.title(f"麻雀算法 路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
         plt.xlabel("纬度")  # 交换标签
         plt.ylabel("经度")  # 交换标签
 
@@ -332,6 +376,6 @@ if __name__ == "__main__":
 
         # ---------------- Folium 地图可视化 (生成html文件，地图坐标不变) ----------------
         # Folium 保持 (纬度, 经度) 的标准地理坐标
-        def plot_beam_search_on_map(best_solution):
+        def plot_sparrow_search_on_map(best_solution):
             # ... (Folium 部分保持不变，因为 Folium 必须使用 [纬度, 经度] 的标准格式)
             print("\n[交互式地图 Folium 部分保持标准地理坐标 (Y:纬度, X:经度)]")

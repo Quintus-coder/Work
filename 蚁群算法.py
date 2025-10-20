@@ -14,9 +14,18 @@ DRONE_SPEED = 40.0  # 无人机速度
 TRUCK_SPEED = 30.0  # 卡车速度
 COST_PER_UNIT_DISTANCE = 0.2
 TRUCK_COST_PER_UNIT_DISTANCE = 0.4
-BEAM_WIDTH = 20
 TARGET_DRONE_RATIO = 0.3  # 无人机期望执行比例
 ALPHA = 0.00001  # 动态平衡因子
+
+PHEROMONE_ALPHA = 1.0
+HEURISTIC_BETA = 3.0
+EVAPORATION_RATE = 0.3
+PHEROMONE_INITIAL = 1.0
+PHEROMONE_MIN = 1e-6
+PHEROMONE_Q = 1.0
+NUM_ANTS = 40
+NUM_ITERATIONS = 80
+RANDOM_SEED = 42
 
 # 仓库位置
 truck_position = np.array([22.584514, 113.131083])  # (纬度, 经度)
@@ -100,65 +109,104 @@ class Node:
         return self.cost < other.cost
 
 
-# ---------------- Beam Search 主体 ----------------
-def beam_search():
-    start = Node(0, truck_position.copy(), 0.0, [], 0)
-    beam = [(0.0, start)]
+# ---------------- 蚁群算法主函数 ----------------
+def ant_colony_optimization():
+    pheromone = np.full((2, NUM_TASKS), PHEROMONE_INITIAL, dtype=float)
     best_cost = float("inf")
-    best_solution = None
+    best_path = None
+    best_drone_count = 0
+    rng = np.random.default_rng(RANDOM_SEED)
 
-    while beam:
-        new_beam = []
-        for _, node in beam:
-            visited_mask = node.visited_mask
+    for _ in range(NUM_ITERATIONS):
+        ant_solutions = []
+        for _ in range(NUM_ANTS):
+            visited_mask = 0
+            truck_pos = truck_position.copy()
+            cost_acc = 0.0
+            path = []
+            drone_count = 0
 
-            # 所有任务完成 → 返回仓库
-            if visited_mask == (1 << NUM_TASKS) - 1:
-                back_cost, _, _ = cost_truck(node.truck_pos, truck_position)
-                final_cost = node.cost + back_cost
+            while visited_mask != (1 << NUM_TASKS) - 1:
+                remaining = [i for i in range(NUM_TASKS) if not (visited_mask >> i) & 1]
+                options = []
+                visited_count = bin(visited_mask).count("1")
 
-                final_node = Node(visited_mask, truck_position.copy(), final_cost,
-                                  node.path + [("truck_back", -1, final_cost)], node.drone_count)
+                for task_id in remaining:
+                    step_cost, new_pos, _ = cost_drone(truck_pos, tasks[task_id])
+                    new_drone_count = drone_count + 1
+                    future_visited = visited_count + 1
+                    drone_ratio = new_drone_count / max(1, future_visited)
+                    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * max(cost_acc, 1.0)
+                    effective_cost = step_cost + balance_penalty
+                    tau = pheromone[0, task_id] ** PHEROMONE_ALPHA
+                    eta = (1.0 / (effective_cost + 1e-9)) ** HEURISTIC_BETA
+                    desirability = tau * eta
+                    options.append(("drone", task_id, step_cost, new_pos, new_drone_count, balance_penalty, effective_cost, desirability))
 
-                if final_cost < best_cost:
-                    best_cost, best_solution = final_cost, final_node
+                    step_cost_truck, new_pos_truck, _ = cost_truck(truck_pos, tasks[task_id])
+                    new_drone_count_truck = drone_count
+                    drone_ratio_truck = new_drone_count_truck / max(1, future_visited)
+                    balance_penalty_truck = abs(drone_ratio_truck - TARGET_DRONE_RATIO) * ALPHA * max(cost_acc, 1.0)
+                    effective_cost_truck = step_cost_truck + balance_penalty_truck
+                    tau_truck = pheromone[1, task_id] ** PHEROMONE_ALPHA
+                    eta_truck = (1.0 / (effective_cost_truck + 1e-9)) ** HEURISTIC_BETA
+                    desirability_truck = tau_truck * eta_truck
+                    options.append(("truck", task_id, step_cost_truck, new_pos_truck, new_drone_count_truck, balance_penalty_truck, effective_cost_truck, desirability_truck))
+
+                if not options:
+                    break
+
+                desirabilities = np.array([opt[-1] for opt in options])
+                total_desirability = desirabilities.sum()
+
+                if total_desirability <= 0:
+                    chosen = min(options, key=lambda x: x[-2])
+                else:
+                    probabilities = desirabilities / total_desirability
+                    idx = rng.choice(len(options), p=probabilities)
+                    chosen = options[idx]
+
+                mode, task_id, step_cost, new_truck_pos, new_drone_count, _, _, _ = chosen
+                visited_mask |= 1 << task_id
+                cost_acc += step_cost
+                path.append((mode, task_id, cost_acc))
+                truck_pos = new_truck_pos
+                drone_count = new_drone_count
+
+            if visited_mask != (1 << NUM_TASKS) - 1:
                 continue
 
-            # 扩展子节点
-            for i in range(NUM_TASKS):
-                if (visited_mask >> i) & 1:
+            back_cost, _, _ = cost_truck(truck_pos, truck_position)
+            total_cost = cost_acc + back_cost
+            path.append(("truck_back", -1, total_cost))
+
+            ant_solutions.append({
+                "path": path,
+                "cost": total_cost,
+                "drone_count": drone_count
+            })
+
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_path = path
+                best_drone_count = drone_count
+
+        pheromone *= (1 - EVAPORATION_RATE)
+        pheromone = np.maximum(pheromone, PHEROMONE_MIN)
+
+        for solution in ant_solutions:
+            deposit = PHEROMONE_Q / solution["cost"]
+            for mode, task_id, _ in solution["path"]:
+                if task_id == -1:
                     continue
+                index = 0 if mode == "drone" else 1
+                pheromone[index, task_id] += deposit
 
-                for mode in ["drone", "truck"]:
-                    if mode == "drone":
-                        step_cost, new_pos, _ = cost_drone(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count + 1
-                    else:
-                        step_cost, new_pos, _ = cost_truck(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count
+    if best_path is None:
+        return None, float("inf")
 
-                    new_node = Node(
-                        visited_mask | (1 << i),
-                        new_pos,
-                        node.cost + step_cost,
-                        node.path + [(mode, i, node.cost + step_cost)],
-                        new_drone_count
-                    )
-
-                    drone_ratio = new_node.drone_count / max(1, bin(new_node.visited_mask).count("1"))
-                    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * node.cost
-                    f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty
-
-                    if mode == "drone":
-                        f -= 0.02
-
-                    new_beam.append((f, new_node))
-
-        beam = sorted(new_beam, key=lambda x: x[0])[:BEAM_WIDTH]
-        if not beam:
-            break
-
-    return best_solution, best_cost
+    best_node = Node((1 << NUM_TASKS) - 1, truck_position.copy(), best_cost, best_path, best_drone_count)
+    return best_node, best_cost
 
 
 # ---------------- 路径偏移辅助函数 ----------------
@@ -176,12 +224,12 @@ def get_offset_vector(p1, p2, magnitude):
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
-    best_solution, best_cost = beam_search()
+    best_solution, best_cost = ant_colony_optimization()
 
     if not best_solution:
         print("❌ 未找到可行方案")
     else:
-        print("\n✅ Beam Search 改进版结果：")
+        print("\n✅ 蚁群算法 改进版结果：")
         print(f"总成本: {best_cost:.4f} 元")
 
         # ---------- Matplotlib 可视化 (横纵坐标对调) ----------
@@ -299,7 +347,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, tasks[task_id])
 
                 # X轴(纬度), Y轴(经度)
-                plt.text(tasks[task_id][0], tasks[task_id][1],
+                plt.text(float(tasks[task_id][0]), float(tasks[task_id][1]),
                          f"{step}", fontsize=8, color='black',
                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle="circle,pad=0.2"),
                          ha='center', va='center', zorder=6)
@@ -311,7 +359,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, truck_position)
                 current_pos = new_pos
 
-        plt.title(f"Beam Search 路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
+        plt.title(f"蚁群算法 路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
         plt.xlabel("纬度")  # 交换标签
         plt.ylabel("经度")  # 交换标签
 
@@ -327,6 +375,6 @@ if __name__ == "__main__":
 
         # ---------------- Folium 地图可视化 (生成html文件，地图坐标不变) ----------------
         # Folium 保持 (纬度, 经度) 的标准地理坐标
-        def plot_beam_search_on_map(best_solution):
+        def plot_ant_colony_on_map(best_solution):
             # ... (Folium 部分保持不变，因为 Folium 必须使用 [纬度, 经度] 的标准格式)
             print("\n[交互式地图 Folium 部分保持标准地理坐标 (Y:纬度, X:经度)]")

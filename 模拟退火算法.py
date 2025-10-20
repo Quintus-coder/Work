@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 # ========== 中文乱码修复配置 ==========
 # 设置中文字体（例如 SimHei 黑体）。如果SimHei不存在，请尝试 'WenQuanYi Micro Hei' 或安装中文字体。
@@ -100,65 +101,83 @@ class Node:
         return self.cost < other.cost
 
 
-# ---------------- Beam Search 主体 ----------------
-def beam_search():
-    start = Node(0, truck_position.copy(), 0.0, [], 0)
-    beam = [(0.0, start)]
-    best_cost = float("inf")
-    best_solution = None
+# ---------------- 模拟退火算法主体 ----------------
+def evaluate_solution(order, modes):
+    current_pos = truck_position.copy()
+    cost = 0.0
+    path = []
+    drone_count = 0
+    visited_mask = 0
 
-    while beam:
-        new_beam = []
-        for _, node in beam:
-            visited_mask = node.visited_mask
+    for task_idx, mode in zip(order, modes):
+        visited_mask |= (1 << task_idx)
+        if mode == 'drone':
+            step_cost, new_pos, _ = cost_drone(current_pos, tasks[task_idx])
+            drone_count += 1
+        else:
+            step_cost, new_pos, _ = cost_truck(current_pos, tasks[task_idx])
 
-            # 所有任务完成 → 返回仓库
-            if visited_mask == (1 << NUM_TASKS) - 1:
-                back_cost, _, _ = cost_truck(node.truck_pos, truck_position)
-                final_cost = node.cost + back_cost
+        cost += step_cost
+        path.append((mode, task_idx, cost))
+        current_pos = new_pos
 
-                final_node = Node(visited_mask, truck_position.copy(), final_cost,
-                                  node.path + [("truck_back", -1, final_cost)], node.drone_count)
+    back_cost, _, _ = cost_truck(current_pos, truck_position)
+    cost += back_cost
+    path.append(('truck_back', -1, cost))
 
-                if final_cost < best_cost:
-                    best_cost, best_solution = final_cost, final_node
-                continue
+    total_tasks = len(order)
+    drone_ratio = drone_count / total_tasks if total_tasks else 0.0
+    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * cost
+    preference_bonus = 0.02 * drone_count
+    objective = cost + balance_penalty - preference_bonus
 
-            # 扩展子节点
-            for i in range(NUM_TASKS):
-                if (visited_mask >> i) & 1:
-                    continue
+    node = Node(visited_mask, truck_position.copy(), cost, path, drone_count)
+    return node, objective
 
-                for mode in ["drone", "truck"]:
-                    if mode == "drone":
-                        step_cost, new_pos, _ = cost_drone(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count + 1
-                    else:
-                        step_cost, new_pos, _ = cost_truck(node.truck_pos, tasks[i])
-                        new_drone_count = node.drone_count
 
-                    new_node = Node(
-                        visited_mask | (1 << i),
-                        new_pos,
-                        node.cost + step_cost,
-                        node.path + [(mode, i, node.cost + step_cost)],
-                        new_drone_count
-                    )
+def simulated_annealing(max_iterations=5000, start_temp=50.0, end_temp=1e-3, cooling_rate=0.995):
+    order = list(range(NUM_TASKS))
+    random.shuffle(order)
 
-                    drone_ratio = new_node.drone_count / max(1, bin(new_node.visited_mask).count("1"))
-                    balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * node.cost
-                    f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty
+    initial_modes = ['truck'] * NUM_TASKS
+    target_drone_tasks = min(NUM_TASKS, max(0, int(round(TARGET_DRONE_RATIO * NUM_TASKS))))
+    for idx in random.sample(range(NUM_TASKS), target_drone_tasks):
+        initial_modes[idx] = 'drone'
 
-                    if mode == "drone":
-                        f -= 0.02
+    modes = initial_modes
 
-                    new_beam.append((f, new_node))
+    current_node, current_objective = evaluate_solution(order, modes)
+    best_node = current_node
+    best_objective = current_objective
 
-        beam = sorted(new_beam, key=lambda x: x[0])[:BEAM_WIDTH]
-        if not beam:
+    temperature = start_temp
+
+    for iteration in range(max_iterations):
+        neighbor_order = order[:]
+        neighbor_modes = modes[:]
+
+        if random.random() < 0.5:
+            i, j = random.sample(range(NUM_TASKS), 2)
+            neighbor_order[i], neighbor_order[j] = neighbor_order[j], neighbor_order[i]
+            neighbor_modes[i], neighbor_modes[j] = neighbor_modes[j], neighbor_modes[i]
+        else:
+            idx = random.randrange(NUM_TASKS)
+            neighbor_modes[idx] = 'drone' if neighbor_modes[idx] == 'truck' else 'truck'
+
+        neighbor_node, neighbor_objective = evaluate_solution(neighbor_order, neighbor_modes)
+        delta = neighbor_objective - current_objective
+        if delta < 0 or random.random() < np.exp(-delta / max(temperature, 1e-8)):
+            order, modes = neighbor_order, neighbor_modes
+            current_node, current_objective = neighbor_node, neighbor_objective
+
+            if neighbor_objective < best_objective:
+                best_node, best_objective = neighbor_node, neighbor_objective
+
+        temperature = max(temperature * cooling_rate, end_temp)
+        if temperature <= end_temp and iteration > max_iterations // 2:
             break
 
-    return best_solution, best_cost
+    return best_node, best_node.cost
 
 
 # ---------------- 路径偏移辅助函数 ----------------
@@ -176,12 +195,12 @@ def get_offset_vector(p1, p2, magnitude):
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
-    best_solution, best_cost = beam_search()
+    best_solution, best_cost = simulated_annealing()
 
     if not best_solution:
         print("❌ 未找到可行方案")
     else:
-        print("\n✅ Beam Search 改进版结果：")
+        print("\n✅ 模拟退火算法结果：")
         print(f"总成本: {best_cost:.4f} 元")
 
         # ---------- Matplotlib 可视化 (横纵坐标对调) ----------
@@ -299,7 +318,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, tasks[task_id])
 
                 # X轴(纬度), Y轴(经度)
-                plt.text(tasks[task_id][0], tasks[task_id][1],
+                plt.text(float(tasks[task_id][0]), float(tasks[task_id][1]),
                          f"{step}", fontsize=8, color='black',
                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle="circle,pad=0.2"),
                          ha='center', va='center', zorder=6)
@@ -311,7 +330,7 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, truck_position)
                 current_pos = new_pos
 
-        plt.title(f"Beam Search 路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
+        plt.title(f"模拟退火路径 (优化可视化 - X轴:纬度, Y轴:经度) 总成本 = {best_cost:.2f} 元")
         plt.xlabel("纬度")  # 交换标签
         plt.ylabel("经度")  # 交换标签
 

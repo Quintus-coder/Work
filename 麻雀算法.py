@@ -1,5 +1,10 @@
+import heapq
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import folium
+from folium import plugins
+import matplotlib as mpl  # 导入 matplotlib 库
 
 # ========== 中文乱码修复配置 ==========
 # 设置中文字体（例如 SimHei 黑体）。如果SimHei不存在，请尝试 'WenQuanYi Micro Hei' 或安装中文字体。
@@ -14,7 +19,7 @@ DRONE_SPEED = 40.0  # 无人机速度
 TRUCK_SPEED = 30.0  # 卡车速度
 COST_PER_UNIT_DISTANCE = 0.4
 TRUCK_COST_PER_UNIT_DISTANCE = 0.2
-BEAM_WIDTH = 30
+BEAM_WIDTH = 20
 TARGET_DRONE_RATIO = 0.3  # 无人机期望执行比例
 ALPHA = 0.00001  # 动态平衡因子
 
@@ -55,39 +60,22 @@ DRONE_ALPHA = 1.0  # 无人机路径不透明
 
 # ---------------- 基础函数 ----------------
 def distance(p1, p2):
-    return float(np.linalg.norm(p1 - p2))       # TODO:这里可能需要修改距离计算方式
+    return float(np.linalg.norm(p1 - p2))
 
 
-def cost_drone_parallel(truck_pos, drone_task, next_task):
-    """
-    无人机执行任务时，卡车并行前往下一个任务点。
-    - drone_task: 无人机要执行的任务点
-    - next_task:  卡车在此期间要前往的任务点
-    返回:
-        total_cost: 无人机往返飞行成本
-        new_truck_pos: 卡车执行完移动后的新位置
-        total_time: 无人机执行往返任务所需时间
-    """
-    # --- 1. 无人机去执行任务 ---
-    to_task_distance = distance(truck_pos, drone_task)
+def cost_drone(truck_pos, task):
+    """无人机往返成本和卡车新位置"""
+    to_task_distance = distance(truck_pos, task)
     to_task_time = to_task_distance / DRONE_SPEED
-
-    # --- 2. 卡车在这段时间内前往下一个任务方向 ---
-    truck_direction = next_task - truck_pos
-    if np.linalg.norm(truck_direction) > 0:
-        truck_direction /= np.linalg.norm(truck_direction)
     truck_move_distance = TRUCK_SPEED * to_task_time
-    new_truck_pos = truck_pos + truck_direction * truck_move_distance
-
-    # --- 3. 无人机完成任务后，返回卡车当前位置 ---
-    return_distance = distance(drone_task, new_truck_pos)
-
-    # --- 4. 成本与时间 ---
+    direction = task - truck_pos
+    if np.linalg.norm(direction) > 0:
+        direction /= np.linalg.norm(direction)
+    new_truck_pos = truck_pos + direction * truck_move_distance
+    return_distance = distance(task, new_truck_pos)
     total_distance = to_task_distance + return_distance
     total_cost = total_distance * COST_PER_UNIT_DISTANCE
-    total_time = total_distance / DRONE_SPEED
-
-    return total_cost, new_truck_pos, total_time
+    return total_cost, new_truck_pos, total_distance / DRONE_SPEED
 
 
 def cost_truck(truck_pos, task):
@@ -118,12 +106,7 @@ class Node:
 
 
 # ---------------- Beam Search 主体 ----------------
-def beam_search_parallel():
-    """
-    改进版 Beam Search：
-    - 无人机执行任务 j 时，卡车可并行前往任务 i
-    - 强制所有任务点必须被服务
-    """
+def beam_search():
     start = Node(0, truck_position.copy(), 0.0, [], 0)
     beam = [(0.0, start)]
     best_cost = float("inf")
@@ -134,79 +117,51 @@ def beam_search_parallel():
         for _, node in beam:
             visited_mask = node.visited_mask
 
-            # ---------- 所有任务完成 → 返回仓库 ----------
+            # 所有任务完成 → 返回仓库
             if visited_mask == (1 << NUM_TASKS) - 1:
                 back_cost, _, _ = cost_truck(node.truck_pos, truck_position)
                 final_cost = node.cost + back_cost
-                final_node = Node(
-                    visited_mask,
-                    truck_position.copy(),
-                    final_cost,
-                    node.path + [("truck_back", -1, final_cost)],
-                    node.drone_count,
-                )
 
-                # ✅ 只接受“覆盖所有任务”的方案
+                final_node = Node(visited_mask, truck_position.copy(), final_cost,
+                                  node.path + [("truck_back", -1, final_cost)], node.drone_count)
+
                 if final_cost < best_cost:
                     best_cost, best_solution = final_cost, final_node
                 continue
 
-            # ---------- 扩展所有可能的下一个任务 ----------
+            # 扩展子节点
             for i in range(NUM_TASKS):
                 if (visited_mask >> i) & 1:
                     continue
 
-                # ---------- 情况1：卡车单独执行任务 i ----------
-                step_cost, new_pos, _ = cost_truck(node.truck_pos, tasks[i])
-                new_node = Node(
-                    visited_mask | (1 << i),
-                    new_pos,
-                    node.cost + step_cost,
-                    node.path + [("truck", i, node.cost + step_cost)],
-                    node.drone_count,
-                )
-                drone_ratio = new_node.drone_count / max(1, bin(new_node.visited_mask).count("1"))
-                balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * node.cost
-
-                # ✅ 对未访问任务加惩罚（鼓励覆盖更多点）
-                unvisited_num = NUM_TASKS - bin(new_node.visited_mask).count("1")
-                penalty_unvisited = unvisited_num * 1e-3
-
-                f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty + penalty_unvisited
-                new_beam.append((f, new_node))
-
-                # ---------- 情况2：无人机执行任务 j，卡车并行执行任务 i ----------
-                for j in range(NUM_TASKS):
-                    if (visited_mask >> j) & 1 or j == i:
-                        continue
-
-                    step_cost, new_pos, _ = cost_drone_parallel(node.truck_pos, tasks[j], tasks[i])
-                    new_drone_count = node.drone_count + 1
+                for mode in ["drone", "truck"]:
+                    if mode == "drone":
+                        step_cost, new_pos, _ = cost_drone(node.truck_pos, tasks[i])
+                        new_drone_count = node.drone_count + 1
+                    else:
+                        step_cost, new_pos, _ = cost_truck(node.truck_pos, tasks[i])
+                        new_drone_count = node.drone_count
 
                     new_node = Node(
-                        visited_mask | (1 << i) | (1 << j),
+                        visited_mask | (1 << i),
                         new_pos,
                         node.cost + step_cost,
-                        node.path + [("drone_parallel", (j, i), node.cost + step_cost)],
-                        new_drone_count,
+                        node.path + [(mode, i, node.cost + step_cost)],
+                        new_drone_count
                     )
 
                     drone_ratio = new_node.drone_count / max(1, bin(new_node.visited_mask).count("1"))
                     balance_penalty = abs(drone_ratio - TARGET_DRONE_RATIO) * ALPHA * node.cost
-                    unvisited_num = NUM_TASKS - bin(new_node.visited_mask).count("1")
-                    penalty_unvisited = unvisited_num * 1e-3
+                    f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty
 
-                    f = new_node.cost + heuristic(new_node.visited_mask, new_pos) + balance_penalty + penalty_unvisited - 0.02
+                    if mode == "drone":
+                        f -= 0.02
+
                     new_beam.append((f, new_node))
 
-        # ---------- 选取 f 值最小的前 BEAM_WIDTH 个节点 ----------
         beam = sorted(new_beam, key=lambda x: x[0])[:BEAM_WIDTH]
         if not beam:
             break
-
-    # ---------- 结果检查 ----------
-    if best_solution is None or best_solution.visited_mask != (1 << NUM_TASKS) - 1:
-        print("⚠️ 未找到覆盖所有任务点的完整方案，请尝试增大 BEAM_WIDTH 或 penalty_unvisited 系数")
 
     return best_solution, best_cost
 
@@ -226,7 +181,7 @@ def get_offset_vector(p1, p2, magnitude):
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
-    best_solution, best_cost = beam_search_parallel()
+    best_solution, best_cost = beam_search()
 
     if not best_solution:
         print("❌ 未找到可行方案")
@@ -266,66 +221,46 @@ if __name__ == "__main__":
         temp_current_pos = truck_position.copy()
 
         for step, (mode, task_id, _) in enumerate(best_solution.path, 1):
-            A_pos = temp_current_pos.copy()
 
-            # --- 处理 task_id (可能是 -1 / int / tuple ) ---
             if task_id == -1:
                 task_coords = truck_position
-            elif isinstance(task_id, tuple):
-                # 并行任务 (j, i)：分别取无人机和卡车的任务点
-                drone_task, truck_task = task_id
-                drone_coords = tasks[drone_task]
-                truck_coords = tasks[truck_task]
             else:
                 task_coords = tasks[task_id]
 
+            A_pos = temp_current_pos.copy()
+
             # ---------------- 计算新位置 ----------------
-            if mode == 'truck' or mode == 'truck_back':
-                # 卡车独立执行：用 cost_truck
-                _, new_pos, _ = cost_truck(A_pos, task_coords)
+            if mode == 'drone':
+                _, new_pos, _ = cost_drone(temp_current_pos, task_coords)
                 C_pos = new_pos.copy()
 
-            elif mode == 'drone_parallel':
-                # 无人机执行 j，卡车同时朝 i 前进 —— 必须用 cost_drone_parallel（三参）
-                total_cost_tmp, new_pos_truck, _ = cost_drone_parallel(A_pos, drone_coords, truck_coords)
-                C_pos = new_pos_truck.copy()
-
-                # （可视化无人机 A→B→C，带一点路径偏移）
+                # --- 计算偏移量 ---
                 offset_vec = get_offset_vector(A_pos, C_pos, OFFSET_MAGNITUDE)
-                A_off = A_pos + offset_vec
-                C_off = C_pos + offset_vec
-                B_off = drone_coords.copy()
 
-                plt.plot([A_off[0], B_off[0]], [A_off[1], B_off[1]],
-                         color=DRONE_COLORS[drone_task_counter % NUM_DRONES],
-                         linestyle=['-', '--', ':'][drone_task_counter % NUM_DRONES],
-                         linewidth=DRONE_LINE_WIDTH, alpha=DRONE_ALPHA, zorder=3)
-                plt.plot([B_off[0], C_off[0]], [B_off[1], C_off[1]],
-                         color=DRONE_COLORS[drone_task_counter % NUM_DRONES],
-                         linestyle=['-', '--', ':'][drone_task_counter % NUM_DRONES],
-                         linewidth=DRONE_LINE_WIDTH, alpha=DRONE_ALPHA, zorder=3)
+                # 无人机路径偏移
+                A_offset = A_pos + offset_vec
+                C_offset = C_pos + offset_vec
+                B_offset = task_coords.copy()
 
-                # 标记 A/C 点
-                plt.scatter(A_pos[0], A_pos[1], marker='x', c=LAUNCH_MARKER_COLOR, s=50, zorder=6)
-                plt.scatter(C_pos[0], C_pos[1], marker='o', c=RENDEZVOUS_MARKER_COLOR, s=30, zorder=6)
+                # 存储无人机路径数据
+                drone_paths_data.append({
+                    'A': A_pos, 'B': task_coords, 'C': C_pos,
+                    'A_plot': A_offset, 'C_plot': C_offset, 'B_plot': B_offset,
+                    'color': DRONE_COLORS[drone_task_counter % NUM_DRONES],
+                    'style': ['-', '--', ':'][drone_task_counter % NUM_DRONES],
+                    'task_id': task_id,
+                    'step': step
+                })
 
-                # 记录一次无人机任务编号（可选）
-                plt.text(drone_coords[0], drone_coords[1], f"{step}", fontsize=8, color='black',
-                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle="circle,pad=0.2"),
-                         ha='center', va='center', zorder=6)
                 drone_task_counter += 1
 
-            elif mode == 'drone':
-                # 如果保留兼容“旧模式”无人机（你的并行搜索一般不会生成这个模式）
-                # 这里应当调用“老的” cost_drone(truck_pos, task)；若你没有这个函数，就不进这个分支
-                raise NotImplementedError("当前并行搜索不产生 'drone' 模式。如需支持请恢复旧版 cost_drone()。")
+            elif mode == 'truck' or mode == 'truck_back':
+                _, new_pos, _ = cost_truck(temp_current_pos, task_coords)
+                C_pos = new_pos.copy()
 
-            else:
-                raise ValueError(f"未知的 mode: {mode}")
-
-                # --- 更新卡车路径点（确保 C_pos 已定义） ---
+            # --- 更新卡车路径点 ---
             truck_path_coords.append(C_pos.copy())
-            temp_current_pos = C_pos.copy()
+            temp_current_pos = C_pos
 
         # --- 2. 绘制连续的卡车路径 ---
         # 交换索引: truck_path_coords[: , 0] 是纬度 (新的X轴)
@@ -369,13 +304,13 @@ if __name__ == "__main__":
                 _, new_pos, _ = cost_truck(current_pos, tasks[task_id])
 
                 # X轴(纬度), Y轴(经度)
-                plt.text(float(tasks[task_id][0]), float(tasks[task_id][1]),
+                plt.text(tasks[task_id][0], tasks[task_id][1],
                          f"{step}", fontsize=8, color='black',
                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle="circle,pad=0.2"),
                          ha='center', va='center', zorder=6)
                 current_pos = new_pos
             elif mode == 'drone':
-                _, new_pos, _ = cost_drone_parallel(current_pos, tasks[task_id])
+                _, new_pos, _ = cost_drone(current_pos, tasks[task_id])
                 current_pos = new_pos
             elif mode == 'truck_back':
                 _, new_pos, _ = cost_truck(current_pos, truck_position)

@@ -135,7 +135,7 @@ def evaluate_solution(order, modes):
     return node, objective
 
 
-def simulated_annealing(max_iterations=5000, start_temp=50.0, end_temp=1e-3, cooling_rate=0.995):
+def simulated_annealing(max_iterations=10000, start_temp=100.0, end_temp=1e-3, cooling_rate=0.99):
     order = list(range(NUM_TASKS))
     random.shuffle(order)
 
